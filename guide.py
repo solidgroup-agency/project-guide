@@ -80,9 +80,38 @@ class ProjectAnalyzer:
 
     def analyze_root(self):
         logging.info("Analyzing root directory...")
-        root_contents = [str(f.relative_to(self.project_dir)) for f in Path(self.project_dir).rglob('*') 
-                        if not self.is_excluded(f)]
-        root_contents_str = '\n'.join(root_contents)
+        
+        # Get only top-level files and directories instead of recursively getting all
+        root_items = [f for f in Path(self.project_dir).iterdir() if not self.is_excluded(f)]
+        
+        # Count files by extension to infer language
+        file_extensions = {}
+        for root, dirs, files in os.walk(self.project_dir):
+            # Skip excluded directories
+            dirs[:] = [d for d in dirs if not self.is_excluded(d)]
+            
+            for file in files:
+                if self.is_excluded(file):
+                    continue
+                ext = os.path.splitext(file)[1].lower()
+                if ext:
+                    file_extensions[ext] = file_extensions.get(ext, 0) + 1
+        
+        # Sort by count and take top 10
+        top_extensions = sorted(file_extensions.items(), key=lambda x: x[1], reverse=True)[:10]
+        extensions_str = "\n".join([f"{ext}: {count} files" for ext, count in top_extensions])
+        
+        # Get only top-level structure for analysis
+        root_structure = []
+        for item in root_items:
+            if item.is_dir():
+                # For directories, show count of files
+                file_count = sum(1 for _ in Path(item).rglob('*') if _.is_file() and not self.is_excluded(_))
+                root_structure.append(f"{item.name}/ (directory with {file_count} files)")
+            else:
+                root_structure.append(f"{item.name}")
+        
+        root_contents_str = '\n'.join(root_structure)
 
         message = self.client.messages.create(
             model="claude-3-5-sonnet-20241022",
@@ -93,8 +122,10 @@ class ProjectAnalyzer:
                 "role": "user",
                 "content": [{
                     "type": "text",
-                    "text": f"Project directory: {self.project_dir}\n\nFiles and directories:\n{root_contents_str}\n\n"
-                    "Based on the directory structure and file names, what is the main language used in this project? "
+                    "text": f"Project directory: {self.project_dir}\n\n"
+                    f"Top file extensions:\n{extensions_str}\n\n"
+                    f"Top-level structure:\n{root_contents_str}\n\n"
+                    "Based on the directory structure, file counts, and extensions, what is the main language used in this project? "
                     "What is the project's purpose? Please provide a comprehensive summary."
                 }]
             }]
@@ -110,8 +141,39 @@ class ProjectAnalyzer:
         logging.info(f"Analyzing file: {rel_path}")
 
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
+            # Get file info
+            file_size = os.path.getsize(file_path)
+            file_extension = os.path.splitext(file_path)[1].lower()
+            
+            # Skip binary files and files that are too large
+            if file_extension in ['.pyc', '.so', '.dll', '.exe', '.bin', '.jpg', '.png', '.gif']:
+                logging.info(f"Skipping binary file: {rel_path}")
+                return f"Binary file (skipped analysis)"
+                
+            # For very large files, truncate content
+            max_file_size = 100 * 1024  # 100KB max for analysis
+            
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    if file_size > max_file_size:
+                        # Read beginning and end of file
+                        beginning = ''.join(f.readline() for _ in range(100))
+                        
+                        # Get to the last part of the file
+                        f.seek(max(0, file_size - max_file_size // 2))
+                        # Clear the current line (it might be partial)
+                        f.readline()
+                        # Read the rest
+                        ending = f.read()
+                        
+                        content = f"{beginning}\n\n... [truncated {file_size - max_file_size} bytes] ...\n\n{ending}"
+                        content_description = f"(truncated, showing first and last parts of {file_size} bytes)"
+                    else:
+                        content = f.read()
+                        content_description = "(full content)"
+            except UnicodeDecodeError:
+                logging.info(f"Skipping binary file (Unicode decode error): {rel_path}")
+                return f"Binary file (skipped analysis)"
 
             message = self.client.messages.create(
                 model="claude-3-5-sonnet-20241022",
@@ -122,12 +184,12 @@ class ProjectAnalyzer:
                     "role": "user",
                     "content": [{
                         "type": "text",
-                        "text": f"Analyze this file: {rel_path}\n\nContent:\n{content}\n\n"
+                        "text": f"Analyze this file: {rel_path} {content_description}\n\nContent:\n{content}\n\n"
                         "Please provide:\n"
                         "1. Overall purpose of the file\n"
-                        "2. List of all fields/variables and their purposes\n"
-                        "3. Function definitions with inputs, outputs, and purposes\n"
-                        "4. Any structs/classes and their significance\n"
+                        "2. Key fields/variables and their purposes (not all, just the most important ones)\n"
+                        "3. Main function definitions with inputs, outputs, and purposes\n"
+                        "4. Any important structs/classes and their significance\n"
                         "5. How this file fits into the project"
                     }]
                 }]
@@ -158,12 +220,49 @@ class ProjectAnalyzer:
             if not files:  # Skip empty directories
                 return
 
+            # For directories with many files, limit how many we analyze in detail
+            max_files_to_analyze = 10
+            if len(files) > max_files_to_analyze:
+                logging.info(f"Directory {rel_path} has {len(files)} files, analyzing only {max_files_to_analyze}")
+                # Sort files by size and get a sample (mix of smallest and largest)
+                files_by_size = sorted(files, key=lambda f: f.stat().st_size)
+                sample_files = files_by_size[:max_files_to_analyze//2] + files_by_size[-max_files_to_analyze//2:]
+                
+                # Get stats for all files
+                file_extensions = {}
+                total_size = 0
+                for file in files:
+                    ext = os.path.splitext(file.name)[1].lower()
+                    if ext:
+                        file_extensions[ext] = file_extensions.get(ext, 0) + 1
+                    total_size += file.stat().st_size
+                
+                ext_summary = ", ".join([f"{ext}: {count}" for ext, count in 
+                                        sorted(file_extensions.items(), key=lambda x: x[1], reverse=True)[:5]])
+                
+                # Add directory summary
+                directory_info = (f"Directory contains {len(files)} files "
+                                 f"({total_size / 1024:.1f} KB total, main extensions: {ext_summary}). "
+                                 f"Analyzing sample of {len(sample_files)} files.")
+                
+                files = sample_files
+            else:
+                directory_info = ""
+                
             # Analyze each file first
             file_summaries = []
             for file in files:
                 summary = self.analyze_file(str(file))
                 if summary:
+                    # Limit summary size to prevent token explosion
+                    if len(summary) > 1000:
+                        summary = summary[:500] + "..." + summary[-500:]
                     file_summaries.append(f"{file.name}: {summary}")
+            
+            # Join summaries but ensure we don't exceed reasonable prompt size
+            combined_summaries = "\n".join(file_summaries)
+            if len(combined_summaries) > 10000:  # Truncate if too long
+                combined_summaries = combined_summaries[:10000] + "... [summaries truncated due to length]"
 
             # Analyze directory as a whole
             if file_summaries:
@@ -176,7 +275,7 @@ class ProjectAnalyzer:
                         "role": "user",
                         "content": [{
                             "type": "text",
-                            "text": f"Analyze this directory: {rel_path}\n\nFiles:\n{''.join(file_summaries)}\n\n"
+                            "text": f"Analyze this directory: {rel_path}\n\n{directory_info}\n\nFiles:\n{combined_summaries}\n\n"
                             "Please provide a summary of this directory's purpose and how its contents work together."
                         }]
                     }]
@@ -232,6 +331,82 @@ class ProjectAnalyzer:
     def _create_markdown_guide(self, findings, initial_summaries):
         """Create the markdown developer guide using collected data"""
         
+        # Truncate initial summaries if too large
+        if len(initial_summaries) > 20000:
+            logging.warning(f"Initial summaries too large ({len(initial_summaries)} chars), truncating")
+            summary_lines = initial_summaries.split('\n')
+            # Keep the project overview and a sample of other summaries
+            important_sections = []
+            
+            # Always include the project overview
+            project_overview_section = []
+            in_overview = False
+            for line in summary_lines:
+                if line.startswith("Project Overview:"):
+                    in_overview = True
+                if in_overview:
+                    project_overview_section.append(line)
+                if in_overview and not line.strip():
+                    in_overview = False
+                    
+            important_sections.extend(project_overview_section)
+            
+            # Take a sample of other sections
+            other_sections = []
+            current_section = []
+            for line in summary_lines:
+                if line.startswith("File:") or line.startswith("Directory:"):
+                    if current_section:
+                        other_sections.append('\n'.join(current_section))
+                        current_section = []
+                current_section.append(line)
+            
+            if current_section:
+                other_sections.append('\n'.join(current_section))
+                
+            # Take a sample of sections (beginning, middle, end)
+            max_sections = 30
+            if len(other_sections) > max_sections:
+                sampled_sections = []
+                sampled_sections.extend(other_sections[:max_sections//3])  # Beginning
+                sampled_sections.extend(other_sections[len(other_sections)//2:len(other_sections)//2 + max_sections//3])  # Middle
+                sampled_sections.extend(other_sections[-max_sections//3:])  # End
+                other_sections = sampled_sections
+                
+            # Join everything
+            truncated_summaries = '\n\n'.join(important_sections + ['\n'.join(other_sections)])
+            truncated_summaries += "\n\n[Note: Summaries were truncated due to size]"
+            initial_summaries = truncated_summaries
+            
+        # Simplify findings JSON to reduce size if needed
+        findings_str = json.dumps(findings, indent=2)
+        if len(findings_str) > 10000:
+            logging.warning(f"Findings JSON too large ({len(findings_str)} chars), simplifying")
+            # Create a simplified version with just the key information
+            simplified_findings = {
+                'root_summary': findings.get('root_summary', ''),
+                'directories': {},
+                'files': {}
+            }
+            
+            # Include only the first 10 and last 10 directories
+            dirs = list(findings.get('directories', {}).items())
+            if len(dirs) > 20:
+                for k, v in dirs[:10] + dirs[-10:]:
+                    simplified_findings['directories'][k] = v
+            else:
+                simplified_findings['directories'] = findings.get('directories', {})
+                
+            # Include only the first 20 and last 20 files
+            files = list(findings.get('files', {}).items())
+            if len(files) > 40:
+                for k, v in files[:20] + files[-20:]:
+                    simplified_findings['files'][k] = v
+            else:
+                simplified_findings['files'] = findings.get('files', {})
+                
+            findings_str = json.dumps(simplified_findings, indent=2)
+            
         message = self.client.messages.create(
             model="claude-3-5-sonnet-20241022",
             max_tokens=4000,
@@ -248,7 +423,7 @@ Initial Summaries:
 {initial_summaries}
 
 Detailed Findings:
-{json.dumps(findings, indent=2)}
+{findings_str}
 
 Create a developer guide that includes:
 
