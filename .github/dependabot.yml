@@ -1,0 +1,26 @@
+# Steuert Dependabot für dieses Repo.
+version: 2
+
+updates:
+  # pip-Security-Updates laufen unabhängig von dieser Datei (GitHub aktiviert sie
+  # repoweit) und ignorieren normale Gruppen. Erst ein Eintrag mit
+  # `applies-to: security-updates` fasst sie zu EINEM Sammel-PR zusammen —
+  # sonst schlägt pro CVE ein eigener PR auf, zuletzt über 40 an einem Tag.
+  #
+  # `open-pull-requests-limit: 0` hält Version-Updates weiterhin aus: die
+  # Entscheidung, npm nicht breit zu aktivieren, bleibt damit bestehen.
+  - package-ecosystem: pip
+    directories:
+      - '**/*'
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+    groups:
+      pip-security:
+        applies-to: security-updates
+        patterns:
+          - '*'
+    commit-message:
+      prefix: chore
+    labels:
+      - dependencies
